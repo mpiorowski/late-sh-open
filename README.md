@@ -6,13 +6,13 @@ Open source parts of [late.sh](https://late.sh), a cozy terminal clubhouse for d
 ssh late.sh
 ```
 
-Lofi radio, live chat, arcade games, daily challenges, and a bonsai tree that grows while you code — all in your terminal.
+Lofi radio, live chat, arcade games, daily challenges, and a bonsai tree that grows while you code, all in your terminal.
 
 ## What's here
 
 | Crate | Description |
 |-------|-------------|
-| [late-cli](late-cli/) | Companion CLI — streams audio locally with a synced visualizer |
+| [late-cli](late-cli/) | Companion CLI: streams audio locally with a synced visualizer |
 
 This repo is a read-only mirror of selected crates from the main (private) repository. It is automatically synced on every CLI release.
 
@@ -33,7 +33,7 @@ curl -fsSL https://cli.late.sh/install.sh | bash
 
 ## Privacy
 
-Your SSH key **fingerprint** is your identity — we don't store the full public key. No IP logging, no tracking, no analytics.
+Your SSH key **fingerprint** is your identity, we don't store the full public key. No IP logging, no tracking, no analytics.
 
 Don't trust that? Use a throwaway key:
 
@@ -43,13 +43,7 @@ ssh-keygen -t ed25519 -f ~/.ssh/late_throwaway && ssh -i ~/.ssh/late_throwaway l
 
 Zero risk, full experience.
 
-## Why open source this?
-
-People asked. Fair enough — if you're SSHing into someone's server and running their binary, you should be able to read the code. The CLI is the part you run locally, so this is the part where open source actually proves something.
-
-The server-side code stays private for now. You can't verify what runs on a remote server anyway, but you can verify what runs on your machine.
-
 ## Links
 
-- [late.sh](https://late.sh) — landing page
-- [GitHub profile](https://github.com/mpiorowski) — the human behind it
+- [late.sh](https://late.sh)
+- [GitHub profile](https://github.com/mpiorowski)
