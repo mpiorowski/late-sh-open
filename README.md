@@ -1,4 +1,4 @@
-# late.sh — open source components
+# late.sh open source components
 
 Open source parts of [late.sh](https://late.sh), a cozy terminal clubhouse for developers.
 
