@@ -145,6 +145,11 @@ struct PlaybackOutputState {
     volume_percent: Arc<AtomicU8>,
 }
 
+struct BuiltOutputStream {
+    stream: cpal::Stream,
+    sample_rate: u32,
+}
+
 enum SshExit {
     Process(std::process::ExitStatus),
     StdoutClosed,
@@ -157,6 +162,14 @@ struct SymphoniaStreamDecoder {
     sample_buf: Vec<f32>,
     sample_pos: usize,
     spec: AudioSpec,
+}
+
+struct StreamingLinearResampler {
+    channels: usize,
+    source_rate: u32,
+    target_rate: u32,
+    position: f64,
+    previous_frame: Option<Vec<f32>>,
 }
 
 struct SshProcess {
@@ -247,6 +260,67 @@ impl SymphoniaStreamDecoder {
 
     fn spec(&self) -> AudioSpec {
         self.spec
+    }
+}
+
+impl StreamingLinearResampler {
+    fn new(channels: usize, source_rate: u32, target_rate: u32) -> Self {
+        Self {
+            channels,
+            source_rate,
+            target_rate,
+            position: 0.0,
+            previous_frame: None,
+        }
+    }
+
+    fn process(&mut self, input: &[f32]) -> Vec<f32> {
+        if self.channels == 0 || input.is_empty() || !input.len().is_multiple_of(self.channels) {
+            return Vec::new();
+        }
+
+        if self.source_rate == self.target_rate {
+            self.previous_frame = Some(input[input.len() - self.channels..input.len()].to_vec());
+            return input.to_vec();
+        }
+
+        let input_frames = input.len() / self.channels;
+        let combined_frames = input_frames + usize::from(self.previous_frame.is_some());
+        if combined_frames < 2 {
+            self.previous_frame = Some(input.to_vec());
+            return Vec::new();
+        }
+
+        let step = self.source_rate as f64 / self.target_rate as f64;
+        let available_intervals = (combined_frames - 1) as f64;
+        let mut output = Vec::new();
+
+        while self.position < available_intervals {
+            let left_idx = self.position.floor() as usize;
+            let right_idx = left_idx + 1;
+            let frac = (self.position - left_idx as f64) as f32;
+            for channel in 0..self.channels {
+                let left = self.frame_sample(input, left_idx, channel);
+                let right = self.frame_sample(input, right_idx, channel);
+                output.push(left + (right - left) * frac);
+            }
+            self.position += step;
+        }
+
+        self.position -= available_intervals;
+        self.previous_frame = Some(input[input.len() - self.channels..input.len()].to_vec());
+        output
+    }
+
+    fn frame_sample(&self, input: &[f32], frame_idx: usize, channel: usize) -> f32 {
+        if let Some(prev) = &self.previous_frame {
+            if frame_idx == 0 {
+                return prev[channel];
+            }
+            return input[(frame_idx - 1) * self.channels + channel];
+        }
+
+        input[frame_idx * self.channels + channel]
     }
 }
 
@@ -459,11 +533,12 @@ fn init_logging(verbose: bool) -> Result<()> {
 impl AudioRuntime {
     async fn start(audio_base_url: String) -> Result<Self> {
         let probe_url = audio_base_url.clone();
-        let spec = tokio::task::spawn_blocking(move || probe_stream_spec(&probe_url))
+        let source_spec = tokio::task::spawn_blocking(move || probe_stream_spec(&probe_url))
             .await
             .context("audio stream probe task failed")??;
+        let output_sample_rate = output_sample_rate_for(source_spec)?;
         let queue = Arc::new(Mutex::new(VecDeque::with_capacity(
-            spec.sample_rate as usize * spec.channels,
+            output_sample_rate as usize * source_spec.channels,
         )));
         let played_ring = Arc::new(Mutex::new(VecDeque::with_capacity(4096)));
         let played_samples = Arc::new(AtomicU64::new(0));
@@ -474,18 +549,27 @@ impl AudioRuntime {
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
 
         let stream = build_output_stream(
-            spec,
+            source_spec,
             Arc::clone(&queue),
             Arc::clone(&played_ring),
             Arc::clone(&played_samples),
             Arc::clone(&muted),
             Arc::clone(&volume_percent),
         )?;
-        spawn_decoder_thread(audio_base_url, queue, spec, Arc::clone(&stop), ready_tx);
+        let output_sample_rate = stream.sample_rate;
+        let stream = stream.stream;
+        spawn_decoder_thread(
+            audio_base_url,
+            queue,
+            source_spec,
+            output_sample_rate,
+            Arc::clone(&stop),
+            ready_tx,
+        );
         spawn_playback_analyzer_thread(
             Arc::clone(&played_ring),
             analyzer_tx.clone(),
-            spec.sample_rate,
+            output_sample_rate,
             Arc::clone(&stop),
         );
         ready_rx
@@ -499,7 +583,7 @@ impl AudioRuntime {
             _stream: stream,
             analyzer_tx,
             played_samples,
-            sample_rate: spec.sample_rate,
+            sample_rate: output_sample_rate,
             stop,
             muted,
             volume_percent,
@@ -622,39 +706,24 @@ fn build_output_stream(
     played_samples: Arc<AtomicU64>,
     muted: Arc<AtomicBool>,
     volume_percent: Arc<AtomicU8>,
-) -> Result<cpal::Stream> {
+) -> Result<BuiltOutputStream> {
     let host = cpal::default_host();
     let device = host
         .default_output_device()
         .context("no default audio output device found")?;
-    let supported = device
+    let supported: Vec<_> = device
         .supported_output_configs()
-        .context("failed to inspect supported output configurations")?;
+        .context("failed to inspect supported output configurations")?
+        .collect();
 
-    let mut chosen = None;
-    let mut chosen_rank = None;
-    for config in supported {
-        let min = config.min_sample_rate().0;
-        let max = config.max_sample_rate().0;
-        if min > spec.sample_rate || spec.sample_rate > max {
-            continue;
-        }
-
-        let rank = output_config_rank(config.channels() as usize, config.sample_format(), spec);
-        let candidate = config.with_sample_rate(cpal::SampleRate(spec.sample_rate));
-        if chosen_rank.is_none_or(|current| rank < current) {
-            chosen = Some(candidate);
-            chosen_rank = Some(rank);
-        }
-    }
-
-    let config = chosen.with_context(|| {
+    let config = choose_output_config(&supported, spec).with_context(|| {
         format!(
             "no supported output configuration found for sample rate {} Hz",
             spec.sample_rate
         )
     })?;
     let channels = config.channels() as usize;
+    let sample_rate = config.sample_rate().0;
     let stream_config = config.config();
     let err_fn = |err| eprintln!("audio output stream error: {err}");
     let output_state = PlaybackOutputState {
@@ -730,13 +799,34 @@ fn build_output_stream(
         other => anyhow::bail!("unsupported sample format: {other:?}"),
     };
 
-    Ok(stream)
+    Ok(BuiltOutputStream {
+        stream,
+        sample_rate,
+    })
 }
 
 fn probe_stream_spec(audio_base_url: &str) -> Result<AudioSpec> {
     let decoder = SymphoniaStreamDecoder::new_http(&trim_stream_suffix(audio_base_url))
         .context("failed to create audio decoder for stream probe")?;
     Ok(decoder.spec())
+}
+
+fn output_sample_rate_for(spec: AudioSpec) -> Result<u32> {
+    let host = cpal::default_host();
+    let device = host
+        .default_output_device()
+        .context("no default audio output device found")?;
+    let supported: Vec<_> = device
+        .supported_output_configs()
+        .context("failed to inspect supported output configurations")?
+        .collect();
+    let config = choose_output_config(&supported, spec).with_context(|| {
+        format!(
+            "no supported output configuration found for sample rate {} Hz",
+            spec.sample_rate
+        )
+    })?;
+    Ok(config.sample_rate().0)
 }
 
 fn write_output_data<T>(output: &mut [T], channels: usize, state: &PlaybackOutputState)
@@ -788,8 +878,9 @@ where
 fn output_config_rank(
     channels: usize,
     sample_format: cpal::SampleFormat,
+    sample_rate: u32,
     spec: AudioSpec,
-) -> (u8, u8, usize) {
+) -> (u8, u32, u8, usize) {
     let channel_rank = if channels == spec.channels {
         0
     } else if spec.channels == 1 && channels >= 1 {
@@ -810,7 +901,44 @@ fn output_config_rank(
         _ => 6,
     };
 
-    (channel_rank, format_rank, channels)
+    (
+        channel_rank,
+        sample_rate.abs_diff(spec.sample_rate),
+        format_rank,
+        channels,
+    )
+}
+
+fn choose_output_config(
+    supported: &[cpal::SupportedStreamConfigRange],
+    spec: AudioSpec,
+) -> Option<cpal::SupportedStreamConfig> {
+    let mut chosen = None;
+    let mut chosen_rank = None;
+
+    for config in supported {
+        let sample_rate = preferred_output_sample_rate(config, spec.sample_rate);
+        let rank = output_config_rank(
+            config.channels() as usize,
+            config.sample_format(),
+            sample_rate,
+            spec,
+        );
+        let candidate = config.with_sample_rate(cpal::SampleRate(sample_rate));
+        if chosen_rank.is_none_or(|current| rank < current) {
+            chosen = Some(candidate);
+            chosen_rank = Some(rank);
+        }
+    }
+
+    chosen
+}
+
+fn preferred_output_sample_rate(
+    config: &cpal::SupportedStreamConfigRange,
+    desired_sample_rate: u32,
+) -> u32 {
+    desired_sample_rate.clamp(config.min_sample_rate().0, config.max_sample_rate().0)
 }
 
 fn map_output_frame(source_frame: &[f32], output_channels: usize) -> Vec<f32> {
@@ -843,7 +971,8 @@ fn mix_for_analyzer(source_frame: &[f32]) -> f32 {
 fn spawn_decoder_thread(
     audio_base_url: String,
     queue: PlaybackQueue,
-    spec: AudioSpec,
+    source_spec: AudioSpec,
+    output_sample_rate: u32,
     stop: Arc<AtomicBool>,
     ready_tx: mpsc::SyncSender<Result<()>>,
 ) {
@@ -860,8 +989,13 @@ fn spawn_decoder_thread(
                 }
             };
 
-        let max_buffer_samples = spec.sample_rate as usize * spec.channels * 2;
-        let mut chunk = Vec::with_capacity(1024 * spec.channels);
+        let max_buffer_samples = output_sample_rate as usize * source_spec.channels * 2;
+        let mut chunk = Vec::with_capacity(1024 * source_spec.channels);
+        let mut resampler = StreamingLinearResampler::new(
+            source_spec.channels,
+            source_spec.sample_rate,
+            output_sample_rate,
+        );
         let mut retries = 0;
         const MAX_RETRIES: usize = 10;
 
@@ -869,7 +1003,7 @@ fn spawn_decoder_thread(
             chunk.clear();
 
             if let Some(decoder) = &mut decoder_opt {
-                for _ in 0..(1024 * spec.channels) {
+                for _ in 0..(1024 * source_spec.channels) {
                     match decoder.next() {
                         Some(sample) => chunk.push(sample),
                         None => {
@@ -909,6 +1043,11 @@ fn spawn_decoder_thread(
                 } else {
                     thread::sleep(Duration::from_millis(10));
                 }
+                continue;
+            }
+
+            let chunk = resampler.process(&chunk);
+            if chunk.is_empty() {
                 continue;
             }
 
@@ -1563,5 +1702,45 @@ mod tests {
     #[test]
     fn analyzer_mix_averages_channels() {
         assert!((mix_for_analyzer(&[0.5, -0.25, 0.25]) - (1.0 / 6.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn preferred_output_sample_rate_uses_native_rate_when_supported() {
+        let config = cpal::SupportedStreamConfigRange::new(
+            2,
+            cpal::SampleRate(44_100),
+            cpal::SampleRate(48_000),
+            cpal::SupportedBufferSize::Unknown,
+            cpal::SampleFormat::F32,
+        );
+        assert_eq!(preferred_output_sample_rate(&config, 44_100), 44_100);
+    }
+
+    #[test]
+    fn preferred_output_sample_rate_clamps_when_native_rate_is_unsupported() {
+        let config = cpal::SupportedStreamConfigRange::new(
+            2,
+            cpal::SampleRate(48_000),
+            cpal::SampleRate(48_000),
+            cpal::SupportedBufferSize::Unknown,
+            cpal::SampleFormat::F32,
+        );
+        assert_eq!(preferred_output_sample_rate(&config, 44_100), 48_000);
+    }
+
+    #[test]
+    fn resampler_passthrough_preserves_native_rate_frames() {
+        let mut resampler = StreamingLinearResampler::new(2, 44_100, 44_100);
+        let input = vec![0.1, -0.1, 0.25, -0.25];
+        assert_eq!(resampler.process(&input), input);
+    }
+
+    #[test]
+    fn resampler_outputs_audio_when_upsampling() {
+        let mut resampler = StreamingLinearResampler::new(1, 44_100, 48_000);
+        let input = vec![0.0, 1.0, 0.0, -1.0];
+        let output = resampler.process(&input);
+        assert!(output.len() >= input.len());
+        assert!(output.iter().all(|sample| (-1.0..=1.0).contains(sample)));
     }
 }
