@@ -1,0 +1,68 @@
+# late
+
+Companion CLI for [late.sh](https://late.sh) — a cozy terminal clubhouse for developers.
+
+Connects to the SSH session and streams lofi audio locally with a live visualizer synced to your terminal.
+
+## Install
+
+```bash
+curl -fsSL https://cli.late.sh/install.sh | bash
+```
+
+## Build from source
+
+```bash
+git clone https://github.com/mpiorowski/late-sh-open
+cd late-sh-open
+cargo build --release --bin late
+# binary at target/release/late
+```
+
+## What it does
+
+1. Opens an SSH session to `late.sh`
+2. Streams audio (lofi/ambient/jazz/classical) to your local speakers
+3. Runs a real-time FFT audio analyzer
+4. Sends visualizer data back to the TUI over WebSocket
+5. Syncs mute/volume controls between terminal and audio
+
+## Usage
+
+```
+late
+```
+
+That's it. On first run it will generate a dedicated SSH key at `~/.ssh/id_late_sh_ed25519`.
+
+### Options
+
+```
+--ssh-target <host>        SSH target (default: late.sh)
+--ssh-bin <command>        SSH client command (default: ssh)
+--audio-base-url <url>     Audio stream URL
+--api-base-url <url>       API URL for WebSocket pairing
+-v, --verbose              Debug logging to stderr
+```
+
+## Requirements
+
+- Linux or macOS (WSL works too)
+- `ssh` client
+- Working audio output device
+- Rust toolchain (if building from source)
+
+## Privacy
+
+The CLI connects to `late.sh` using your SSH key. Only your key **fingerprint** is stored — not the full public key. No IP logging, no tracking.
+
+If you'd rather not use your real key:
+
+```bash
+ssh-keygen -t ed25519 -f ~/.ssh/late_throwaway
+late --ssh-bin "ssh -i ~/.ssh/late_throwaway"
+```
+
+## License
+
+Source code provided for transparency and auditability. See [late.sh](https://late.sh) for terms.
