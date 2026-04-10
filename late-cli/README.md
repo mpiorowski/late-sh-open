@@ -54,6 +54,8 @@ That's it. On first run it will generate a dedicated SSH key at `~/.ssh/id_late_
 
 If your audio device does not support the stream's native `44.1 kHz` output rate, the CLI now falls back to a supported device rate such as `48 kHz` and resamples locally. Native `44.1 kHz` playback is still preferred when available.
 
+On WSL, audio startup failures now include a targeted hint covering `DISPLAY`, `WAYLAND_DISPLAY`, and `PULSE_SERVER` so users get an actionable fix path instead of only raw ALSA errors.
+
 ## Privacy
 
 The CLI connects to `late.sh` using your SSH key. Only your key **fingerprint** is stored — not the full public key. No IP logging, no tracking.
@@ -67,4 +69,5 @@ late --ssh-bin "ssh -i ~/.ssh/late_throwaway"
 
 ## License
 
-Source code provided for transparency and auditability. See [late.sh](https://late.sh) for terms.
+This repo is source-available under [`FSL-1.1-MIT`](../LICENSE). See
+[`LICENSING.md`](../LICENSING.md) for the plain-English usage policy.

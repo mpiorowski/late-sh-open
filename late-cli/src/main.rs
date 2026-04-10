@@ -362,7 +362,12 @@ async fn main() -> Result<()> {
     let _raw_mode = RawModeGuard::enable_if_tty();
 
     info!("starting audio runtime");
-    let audio = AudioRuntime::start(config.audio_base_url.clone()).await?;
+    let audio = AudioRuntime::start(config.audio_base_url.clone())
+        .await
+        .map_err(|err| {
+            let hint = audio_startup_hint();
+            anyhow::anyhow!("failed to start local audio: {err:#}\n\n{hint}")
+        })?;
     info!(sample_rate = audio.sample_rate, "audio runtime ready");
     info!("starting ssh session");
     let (token_tx, token_rx) = oneshot::channel();
@@ -544,7 +549,7 @@ impl AudioRuntime {
         let played_samples = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let muted = Arc::new(AtomicBool::new(false));
-        let volume_percent = Arc::new(AtomicU8::new(100));
+        let volume_percent = Arc::new(AtomicU8::new(30));
         let (analyzer_tx, _) = broadcast::channel(32);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
 
@@ -811,6 +816,42 @@ fn probe_stream_spec(audio_base_url: &str) -> Result<AudioSpec> {
     Ok(decoder.spec())
 }
 
+fn audio_startup_hint() -> String {
+    if is_wsl() {
+        if missing_wsl_audio_env() {
+            return "WSL was detected, but no Linux audio bridge appears configured.\n\
+                    Checked env: DISPLAY, WAYLAND_DISPLAY, PULSE_SERVER.\n\
+                    To enable audio:\n\
+                    - On WSLg, update WSL/Windows and verify audio works in another Linux app\n\
+                    - Otherwise run a PulseAudio server on Windows and set PULSE_SERVER\n\
+                    - Then rerun `late`"
+                .to_string();
+        }
+
+        return "WSL was detected and audio startup still failed.\n\
+                Verify audio works in another Linux app first, then rerun `late`.\n\
+                If you use a Windows PulseAudio server, confirm `PULSE_SERVER` points to it."
+            .to_string();
+    }
+
+    "Check that this machine has a usable default audio output device and that another app can play sound, then rerun `late`."
+        .to_string()
+}
+
+fn is_wsl() -> bool {
+    env::var_os("WSL_DISTRO_NAME").is_some() || env::var_os("WSL_INTEROP").is_some()
+}
+
+fn missing_wsl_audio_env() -> bool {
+    ["DISPLAY", "WAYLAND_DISPLAY", "PULSE_SERVER"]
+        .into_iter()
+        .all(env_var_missing_or_blank)
+}
+
+fn env_var_missing_or_blank(key: &str) -> bool {
+    env::var(key).map_or(true, |value| value.trim().is_empty())
+}
+
 fn output_sample_rate_for(spec: AudioSpec) -> Result<u32> {
     let host = cpal::default_host();
     let device = host
@@ -836,7 +877,8 @@ where
     let mut queue = state.queue.lock().unwrap_or_else(|e| e.into_inner());
     let mut played_ring = state.played_ring.lock().unwrap_or_else(|e| e.into_inner());
     let muted = state.muted.load(Ordering::Relaxed);
-    let volume = state.volume_percent.load(Ordering::Relaxed) as f32 / 100.0;
+    let linear = state.volume_percent.load(Ordering::Relaxed) as f32 / 100.0;
+    let volume = linear * linear;
     let source_channels = state.source_channels;
 
     for frame in output.chunks_mut(channels) {
@@ -1485,12 +1527,12 @@ fn apply_pair_control(text: &str, muted: &AtomicBool, volume_percent: &AtomicU8)
             Ok(true)
         }
         PairControlMessage::VolumeUp => {
-            let new_volume = bump_volume(volume_percent, 10);
+            let new_volume = bump_volume(volume_percent, 5);
             info!(volume_percent = new_volume, "applied paired volume up");
             Ok(true)
         }
         PairControlMessage::VolumeDown => {
-            let new_volume = bump_volume(volume_percent, -10);
+            let new_volume = bump_volume(volume_percent, -5);
             info!(volume_percent = new_volume, "applied paired volume down");
             Ok(true)
         }
@@ -1632,7 +1674,7 @@ mod tests {
         let volume_percent = AtomicU8::new(50);
 
         apply_pair_control(r#"{"event":"volume_up"}"#, &muted, &volume_percent).unwrap();
-        assert_eq!(volume_percent.load(Ordering::Relaxed), 60);
+        assert_eq!(volume_percent.load(Ordering::Relaxed), 55);
 
         apply_pair_control(r#"{"event":"volume_down"}"#, &muted, &volume_percent).unwrap();
         assert_eq!(volume_percent.load(Ordering::Relaxed), 50);
@@ -1726,6 +1768,22 @@ mod tests {
             cpal::SampleFormat::F32,
         );
         assert_eq!(preferred_output_sample_rate(&config, 44_100), 48_000);
+    }
+
+    #[test]
+    fn env_var_missing_or_blank_treats_missing_and_blank_as_missing() {
+        let key = "LATE_TEST_AUDIO_HINT_ENV";
+
+        unsafe { env::remove_var(key) };
+        assert!(env_var_missing_or_blank(key));
+
+        unsafe { env::set_var(key, "   ") };
+        assert!(env_var_missing_or_blank(key));
+
+        unsafe { env::set_var(key, "set") };
+        assert!(!env_var_missing_or_blank(key));
+
+        unsafe { env::remove_var(key) };
     }
 
     #[test]
