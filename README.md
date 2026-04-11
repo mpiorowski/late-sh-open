@@ -1,5 +1,7 @@
 # late.sh — open source components
 
+Deprecated - I've open the core repo :) Just go to https://github.com/mpiorowski/late-sh
+
 Open source parts of [late.sh](https://late.sh), a cozy terminal clubhouse for developers.
 
 ```
